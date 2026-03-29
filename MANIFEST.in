@@ -1,0 +1,2 @@
+include module_name/path/to/config.yml
+include README.md
