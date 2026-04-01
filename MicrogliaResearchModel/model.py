@@ -2073,3 +2073,7 @@ def main():
     else:
         plt.show()
         plt.close(fig)
+        
+# If this script is run directly, execute the main function
+if __name__ == "__main__":
+    main() # takes CLI args for custom runs, or just runs with defaults if no args provided
