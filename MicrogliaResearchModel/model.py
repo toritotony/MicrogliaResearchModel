@@ -1904,8 +1904,8 @@ def run_sim(
     )
 
     for _ in range(steps):
-        if not any((n.pos is not None) and n.damaged for n in model.neurons):
-            break
+        #if not any((n.pos is not None) and n.damaged for n in model.neurons):
+        #    break
         model.step()
     df = model.datacollector.get_model_vars_dataframe()
     return model, df
