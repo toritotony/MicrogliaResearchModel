@@ -48,7 +48,8 @@ setuptools.setup(
           'six==1.17.0',
           'tqdm==4.67.3',
           'tzdata==2025.3',
-          'urllib3==2.6.3'
+          'urllib3==2.6.3',
+          'networkx==3.6.1'
      ],
      python_requires=">=3.12",   
      packages=["MicrogliaResearchModel"],
