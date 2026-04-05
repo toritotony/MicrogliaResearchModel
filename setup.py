@@ -1,7 +1,7 @@
 import setuptools
 setuptools.setup(     
      name="MicrogliaResearchModel",     
-     version="1.0.0",
+     version="1.0.1",
      author='Anthony Wolfe',
      author_email='wolfeanthony584@gmail.com',
      description='An Agent Based Model simulating immune cell interactions in CNS.',
