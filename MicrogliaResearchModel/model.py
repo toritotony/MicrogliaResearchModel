@@ -1,17 +1,9 @@
 from __future__ import annotations
-from typing import Tuple, Set
 from mesa import Agent, Model
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
 import numpy as np
-import pandas as pd
-import io
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import json
-from datetime import datetime
-from matplotlib.lines import Line2D
 import os
 import argparse
 
@@ -2052,10 +2044,19 @@ def main():
     ap.add_argument("--apoe_genotype", type=str, default="3/3")
     ap.add_argument("--trem2_mutation_rate", type=float, default=0.0)
     ap.add_argument("--trem2_mutant_activity", type=float, default=0.5)
+    ap.add_argument("--output_csv", type=str, default="results.csv")
+    ap.add_argument("--no_csv", action="store_true")
+    ap.add_argument("--summary_png", type=str, default=None)
+    ap.add_argument("--no_plot", action="store_true")
 
     args, _ = ap.parse_known_args()
+    run_kwargs = vars(args).copy()
+    output_csv = run_kwargs.pop("output_csv")
+    no_csv = run_kwargs.pop("no_csv")
+    summary_png = run_kwargs.pop("summary_png")
+    no_plot = run_kwargs.pop("no_plot")
 
-    model, df_raw = run_sim(**vars(args))
+    model, df_raw = run_sim(**run_kwargs)
 
     # Normalize columns similar to the UI
     df = df_raw.copy()
@@ -2074,9 +2075,13 @@ def main():
     print(df.tail(1).to_string(index=False))
     print(f"Stopped at tick {int(df['step'].iloc[-1])}")
 
-    # Save the full dataframe as CSV
-    df.to_csv("results.csv", index=False)
-    print("Saved results to results.csv")
+    # Save the full dataframe as CSV when requested.
+    if output_csv and not no_csv:
+        df.to_csv(output_csv, index=False)
+        print(f"Saved results to {output_csv}")
+
+    if no_plot:
+        return
 
     # NOTE: now 4 subplots to include astrocytes
     fig, axs = plt.subplots(1, 4, figsize=(17, 4))
@@ -2126,9 +2131,11 @@ def main():
     axs[3].legend()
 
     plt.tight_layout()
-    if os.environ.get("SOLARA_SERVER"):
-        plt.savefig("summary.png", dpi=150)
+    if summary_png or os.environ.get("SOLARA_SERVER"):
+        out_path = summary_png or "summary.png"
+        plt.savefig(out_path, dpi=150)
         plt.close(fig)
+        print(f"Saved summary plot to {out_path}")
     else:
         plt.show()
         plt.close(fig)

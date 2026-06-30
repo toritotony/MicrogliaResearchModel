@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MicrogliaResearchModel"
+version = "1.0.2"
+description = "An agent-based Mesa model of microglia, neurons, astrocytes, amyloid, and inflammatory signaling in CNS tissue."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Anthony Wolfe", email = "wolfeanthony584@gmail.com" }
+]
+keywords = [
+    "agent-based-model",
+    "mesa",
+    "microglia",
+    "astrocytes",
+    "neurons",
+    "amyloid",
+    "neuroinflammation"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering"
+]
+dependencies = [
+    "Mesa>=3.5,<4",
+    "matplotlib>=3.8",
+    "numpy>=2.0",
+    "pandas>=2.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/toritotony/MicrogliaResearchModel"
+Repository = "https://github.com/toritotony/MicrogliaResearchModel"
+
+[project.scripts]
+microglia-research-model = "MicrogliaResearchModel.model:main"
+
+[tool.setuptools.packages.find]
+include = ["MicrogliaResearchModel*"]
