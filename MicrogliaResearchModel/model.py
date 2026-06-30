@@ -161,7 +161,6 @@ class Neuron(Agent):
                 self.become_damaged()
 
         if self.damaged and (self.lipid_droplets >= 6.0 or self.toxic_lipids >= 5.0) and not self.dead:
-            self.ticks_damaged += 1
             x, y = self.pos
             self.model.damage_val[x, y] += 0.5
         
@@ -239,7 +238,7 @@ class Astrocyte(Agent):
         Internal State Variables:
             pos (Tuple[int, int]): current position of the astrocyte on the grid, used for sensing and interactions.
             wait_ticks (int): if the astrocyte is currently "busy" (e.g., performing a function), it will wait for this many ticks before acting again. Defaults to 0.
-            resolution_ticks (int): counts how many ticks the astrocyte has been in a low-signal environment while in A2 phenotype, used to determine when to resolve back to A0. Defaults to 0.
+            resolution_ticks (int): counts how many ticks the astrocyte has been in a low-signal environment while in A1 or A2 phenotype, used to determine when to resolve back to A0. Defaults to 0.
             coverage_radius (int): how far the astrocyte can influence the local environment (e.g., cytokine modulation, neuron interactions). Defaults to model parameter.
             lipid_pool (float): represents the astrocyte's capacity to take up and detoxify lipids from neurons, which can influence its protective functions. Defaults to 1.0.
         """
@@ -309,7 +308,7 @@ class Astrocyte(Agent):
                 - If ratio is strongly pro, switch to A1 from A0 with some probability.
                 - If ratio is strongly anti, switch to A2 from A0 with some probability.
                 - If ratio is in the middle, allow drift back to A0 with some probability.
-                - If currently A2 and total signal is low, count resolution ticks and switch back to A0 after threshold is met.
+                - If currently A1 or A2 and total signal is low, count resolution ticks and switch back to A0 after threshold is met.
         """
         if self.pos is None:
             return
@@ -357,14 +356,15 @@ class Astrocyte(Agent):
                     if r2 < p_anti:
                         self.phenotype = "A2"
                 else:
+                    # Balanced pro/anti ratio window: anti_thresh < ratio < pro_thresh.
                     if r2 < p_homeo:
                         self.phenotype = "A0"
 
-        # resolution: A2 -> A0 after long low-signal
-        if self.phenotype == "A2":
+        # resolution: A1/A2 -> A0 after long low-signal
+        if self.phenotype in ("A1", "A2"):
             if total < homeo_thresh:
                 self.resolution_ticks += 1
-                if self.resolution_ticks >= self.model.a2_to_a0_resolution_ticks:
+                if self.resolution_ticks >= self.model.a0_resolution_ticks:
                     self.phenotype = "A0"
                     self.resolution_ticks = 0
             else:
@@ -491,7 +491,7 @@ class Microglia(Agent):
             pos (Tuple[int, int]): current position of the microglia on the grid,
             isLDAM (bool): indicates whether the microglia is loaded with lipid droplets (LDAM).
             wait_ticks (int, optional): if the microglia is currently "busy" (e.g., performing phagocytosis or surveillance), it will wait for this many ticks before acting again. Defaults to 0.
-            resolution_ticks (int, optional): counts how many ticks the microglia has been in a low-signal environment while in M2 phenotype, used to determine when to resolve back to M0. Defaults to 0.
+            resolution_ticks (int, optional): counts how many ticks the microglia has been in a low-signal environment while in M1 or M2 phenotype, used to determine when to resolve back to M0. Defaults to 0.
             lipid_droplets (float, optional): represents the microglia's lipid droplet burden, which can influence its behavior and cytokine production. Defaults to 0.0.
             amyloid_exposure (float, optional): cumulative exposure to amyloid based on neighbors, which can influence activation and LD accumulation. Defaults to 0.0.
             amyloid_exposed_ticks (int, optional): how many ticks the microglia has been exposed to amyloid, which can influence chronic activation and dysfunction. Defaults to 0.
@@ -534,25 +534,29 @@ class Microglia(Agent):
 
         for agent in cells:
             if isinstance(agent, Neuron) and not agent.dead:
-                transfer = min(
-                    self.model.ldam_neuron_toxic_lipid_transfer,
-                    self.lipid_droplets,
-                )
-                if transfer > 0:
-                    self.lipid_droplets -= transfer
-                    agent.toxic_lipids += transfer * self.model.apoe_multiplier
+                self._transfer_toxic_lipid_to_neuron(agent)
                 break
+
+    def _transfer_toxic_lipid_to_neuron(self, neuron: "Neuron") -> bool:
+        """Transfer one LDAM toxic-lipid packet to a living neuron."""
+        if neuron.dead or self.lipid_droplets <= 0.0:
+            return False
+        transfer = min(
+            self.model.ldam_neuron_toxic_lipid_transfer,
+            self.lipid_droplets,
+        )
+        if transfer <= 0.0:
+            return False
+        self.lipid_droplets -= transfer
+        neuron.toxic_lipids += transfer * self.model.apoe_multiplier
+        return True
     
     def update_ldam_status(self):
         """ Update LDAM status based on lipid droplet burden, representing the idea that microglia with high lipid droplet accumulation can become dysfunctional and adopt characteristics such as impaired movement, phagocytosis, and increase in inflammatory cytokines and toxic lipid transfer to neurons"""
         if self.lipid_droplets >= self.model.ldam_threshold:
             self.isLDAM = True
-            self.sense_eff = max(0.1, self.model.base_sensing_efficiency * 0.5)  # LDAM have impaired sensing
-            self.eat_eff = max(0.01, self.model.base_eat_probability * 0.5)  # LDAM have impaired phagocytosis
         else:
             self.isLDAM = False
-            self.sense_eff = self.model.base_sensing_efficiency
-            self.eat_eff = self.model.base_eat_probability
             
     def update_dam_status(self):
         """ Update DAM status based on local amyloid exposure and TREM2 activity, representing the process by which microglia sense amyloid in their environment and become activated into a DAM phenotype, which is influenced by TREM2 function. This activation can lead to increased phagocytic activity and cytokine production, but also contributes to chronic inflammation and potential neurotoxicity if sustained."""
@@ -586,8 +590,14 @@ class Microglia(Agent):
         eat = self.model.base_eat_probability
         sense = self.model.base_sensing_efficiency
         
-        # Continuous lipid-dependent impairment
-        lipid_factor = 1.0 / (1.0 + 0.05 * self.lipid_droplets)
+        # Continuous lipid-dependent impairment. Recent amyloid exposure
+        # amplifies the functional cost of accumulated lipid burden.
+        lipid_impairment_scale = max(0.0, self.model.microglia_lipid_impairment_factor)
+        if self.amyloid_exposed_ticks > 0:
+            lipid_impairment_scale *= (
+                1.0 + max(0.0, self.model.microglia_amyloid_impairment_factor)
+            )
+        lipid_factor = 1.0 / (1.0 + lipid_impairment_scale * self.lipid_droplets)
         eat *= lipid_factor
         sense *= lipid_factor
 
@@ -612,7 +622,7 @@ class Microglia(Agent):
 
         plus:
         - a minimal total-signal threshold to allow homeostasis,
-        - M2 -> M0 if low-signal persists.
+        - M1/M2 -> M0 if low-signal persists.
         """
         if self.pos is None:
             return
@@ -646,14 +656,15 @@ class Microglia(Agent):
                 if r < p_anti:
                     self.phenotype = "M2"
             else:
+                # Balanced pro/anti ratio window: anti_thresh < ratio < pro_thresh.
                 if r < p_homeo:
                     self.phenotype = "M0"
 
-        # --- Resolution-based M2 -> M0 ---
-        if self.phenotype == "M2":
+        # --- Resolution-based M1/M2 -> M0 ---
+        if self.phenotype in ("M1", "M2"):
             if total < homeo_thresh:
                 self.resolution_ticks += 1
-                if self.resolution_ticks >= self.model.m2_to_m0_resolution_ticks:
+                if self.resolution_ticks >= self.model.m0_resolution_ticks:
                     self.phenotype = "M0"
                     self.resolution_ticks = 0
             else:
@@ -672,7 +683,8 @@ class Microglia(Agent):
 
     def _chemotaxis_step(self, field_name: str):
         """
-        Gradient-following that always moves to a neighbor. Gets highest value of some field attribute in neighborhood and moves there, with random tie-breaking.
+        Gradient-following that always moves one patch, using neuron_distance
+        as the sensing radius for the damage/inflammation field.
 
         Used for chemotaxis up neuro-derived damage field.
         """
@@ -683,7 +695,15 @@ class Microglia(Agent):
         if not neighbors:
             return
 
-        vals = [(n, self._field_value(field, n)) for n in neighbors]
+        sense_radius = max(1, int(self.model.neuron_distance))
+
+        def sensed_field_value(pos):
+            sensed_positions = self.model.grid.get_neighborhood(
+                pos, moore=True, include_center=True, radius=sense_radius
+            )
+            return max(self._field_value(field, p) for p in sensed_positions)
+
+        vals = [(n, sensed_field_value(n)) for n in neighbors]
         max_val = max(v for _, v in vals)
         candidates = [p for p, v in vals if v == max_val]
         new_pos = self.model.random.choice(candidates)
@@ -748,8 +768,7 @@ class Microglia(Agent):
                 return True
             # Export toxic lipids to living neurons only if LDAM
             elif (not neuron.dead) and neuron.pos is not None and self.isLDAM:
-                self.lipid_droplets = max(0.0, self.lipid_droplets - self.model.ldam_neuron_toxic_lipid_transfer)
-                neuron.toxic_lipids += self.model.ldam_neuron_toxic_lipid_transfer
+                self._transfer_toxic_lipid_to_neuron(neuron)
 
         # No dead neuron, but there is at least one neuron -> surveillance
         self.wait_ticks = 5
@@ -783,8 +802,7 @@ class Microglia(Agent):
             # After phagocytosis check, export toxic lipids if LDAM and neuron still exists and is not dead
             elif (not neuron.dead) and self.isLDAM and neuron.pos is not None:
                 # Export toxic lipids to Neurons from lipid pool (only if still alive)
-                self.lipid_droplets = max(0.0, self.lipid_droplets - self.model.ldam_neuron_toxic_lipid_transfer)
-                neuron.toxic_lipids += self.model.ldam_neuron_toxic_lipid_transfer
+                self._transfer_toxic_lipid_to_neuron(neuron)
         return False
 
     def _interact_M2(self) -> bool:
@@ -833,8 +851,7 @@ class Microglia(Agent):
             # Export toxic lipids to living neurons only at the end of processing
             elif (not neuron.dead) and self.isLDAM and neuron.pos is not None:
                 # Export toxic lipids to living neurons from lipid pool
-                self.lipid_droplets = max(0.0, self.lipid_droplets - self.model.ldam_neuron_toxic_lipid_transfer)
-                neuron.toxic_lipids += self.model.ldam_neuron_toxic_lipid_transfer
+                self._transfer_toxic_lipid_to_neuron(neuron)
         return False
 
 
@@ -852,8 +869,11 @@ class Microglia(Agent):
         neigh = self.model.grid.get_neighborhood(pos, moore=True, include_center=True)
         
         # Lipid-droplet-boosted pro-inflammatory trail, if LD burden is above threshold, boost pro-inflammatory signal emitted along path, representing idea that LD-burdened microglia are more pro-inflammatory and can create a more hostile environment that further attracts microglia and damages neurons. This creates a positive feedback loop where stressed microglia with high LDs amplify inflammation in their vicinity.
+        lipid_pro_inflam_active = (
+            self.lipid_droplets >= self.model.microglia_ld_pro_inflam_threshold
+        )
         ldam_factor = 1.0
-        if self.isLDAM:
+        if lipid_pro_inflam_active:
             ldam_factor += self.model.microglia_ldam_inflam_boost
 
         if self.phenotype == "M1":
@@ -864,20 +884,23 @@ class Microglia(Agent):
             # anti-inflam trail
             for nx, ny in neigh:
                 self.model.anti_inflam_val[nx, ny] += 0.2
-                if self.isLDAM:
+                if lipid_pro_inflam_active:
                     self.model.pro_inflam_val[nx,ny] += 0.2 * ldam_factor
                 
     # instead of repeating the same code in each interaction method, we can just call this after interaction
     def amyloid_exposure_update(self):
-        """ Update amyloid exposure and resulting effects, representing the microglia's role in sensing and responding to amyloid pathology. This method checks the local amyloid environment, updates the microglia's cumulative exposure, and applies consequences such as lipid droplet accumulation, impaired function, and increased pro-inflammatory signaling. This allows the model to capture how microglia can become activated and dysfunctional in response to amyloid, which is a key aspect of Alzheimer's disease pathology."""
-        if self.amyloid_exposed_ticks == 0:
-            self.eat_eff = self.model.base_eat_probability 
-            self.sense_eff = self.model.base_sensing_efficiency
-        
-        # Check if amount totals to fibril or plaque level and if so, produce lipid droplets to represent amyloid-driven microglial stress and dysfunction, reduce ability to phagocytose, sensing, and amyloid exposure to represent microglia's role in clearing amyloid, then increase local pro-inflammatory signal to represent amyloid-driven activation and recruitment.
+        """ Update amyloid exposure and resulting effects, representing the microglia's role in sensing and responding to amyloid pathology. This method checks the local amyloid environment, updates the microglia's cumulative exposure, and applies consequences such as lipid droplet accumulation, amyloid clearance, and increased pro-inflammatory signaling. Functional impairment is recalculated centrally in compute_effective_params()."""
+        # Check if amyloid reaches fibril/plaque levels; if so, add lipid
+        # burden, clear nearby amyloid, and emit a pro-inflammatory signal.
         neighborhood = self.model.grid.get_neighborhood(self.pos, moore=True, include_center=True)
-        self.amyloid_exposure = sum(self._field_value(self.model.amyloid_val, neighbor) for neighbor in self.model.grid.get_neighborhood(self.pos, moore=True, include_center=False))
-        max_exposure = max(self._field_value(self.model.amyloid_val, neighbor) for neighbor in self.model.grid.get_neighborhood(self.pos, moore=True, include_center=False))
+        self.amyloid_exposure = sum(
+            self._field_value(self.model.amyloid_val, neighbor)
+            for neighbor in neighborhood
+        )
+        max_exposure = max(
+            self._field_value(self.model.amyloid_val, neighbor)
+            for neighbor in neighborhood
+        )
         if self.amyloid_exposure >= self.model.amyloid_fibril_thresh or max_exposure >= self.model.amyloid_fibril_thresh:
             self.lipid_droplets += (
                 self.model.microglia_ld_from_amyloid
@@ -885,8 +908,6 @@ class Microglia(Agent):
                 * self.model.apoe_multiplier
             )
             self.lipid_droplets = min(self.lipid_droplets, self.model.microglia_ld_max)
-            self.eat_eff = max(0.01, self.model.base_eat_probability - self.lipid_droplets * self.model.microglia_amyloid_impairment_factor)
-            self.sense_eff = max(0.01, self.model.base_sensing_efficiency - self.lipid_droplets * self.model.microglia_amyloid_impairment_factor)
             self.amyloid_exposed_ticks += 1
             for neighbor in neighborhood:
                 if self.model.amyloid_val[neighbor] > self.model.amyloid_fibril_thresh:
@@ -898,7 +919,7 @@ class Microglia(Agent):
             x, y = self.pos
             self.model.pro_inflam_val[x, y] += 0.5
         else:
-            self.amyloid_exposed_ticks = min(0, self.amyloid_exposed_ticks - 1)
+            self.amyloid_exposed_ticks = max(0, self.amyloid_exposed_ticks - 1)
 
     def step(self):
         """ Step logic:
@@ -934,6 +955,8 @@ class Microglia(Agent):
                 x, y = self.pos
                 self.model.anti_inflam_val[x, y] += burn * self.model.microglia_ld_to_anti_inflam
 
+        self.update_ldam_status()
+
         # 2️) Compute effective parameters for THIS tick
         self.compute_effective_params()
         
@@ -948,14 +971,18 @@ class Microglia(Agent):
         base_speed = max(0.0, 1.0 + 0.05 * (72 - 37.0))  # your original temperature logic
         if self.phenotype == "M1":
             speed_factor = 1.5
-        elif self.isLDAM:
-            speed_factor = 0.5  # LDAM microglia are slower due to dysfunction
         else:
             speed_factor = 1.0
+        ldam_speed_factor = 0.5 if self.isLDAM else 1.0  # LDAM microglia are slower due to dysfunction
+        speed_factor *= ldam_speed_factor
         speed = base_speed * speed_factor
         moves = 1
         extra = speed - 1.0
-        if extra > 0 and self.model.random.random() < extra:
+        extra_move_prob = max(0.0, min(1.0, extra))
+        if self.isLDAM and extra > 1.0:
+            # The two-move cap can otherwise hide LDAM slowing for fast M1 cells.
+            extra_move_prob *= ldam_speed_factor
+        if self.model.random.random() < extra_move_prob:
             moves += 1
 
         acted = False
@@ -1002,10 +1029,10 @@ class MicrogliaNeuronModel(Model):
         init_a2_astrocytes: int = 5,
         astro_coverage_radius: int = 2,
         # core microglia behavior
-        base_eat_probability: float = 0.70,  # to reset after amyloid impairment
+        base_eat_probability: float | None = None,  # defaults to eat_probability
         eat_probability: float = 0.70,
         sensing_efficiency: float = 0.50,
-        base_sensing_efficiency: float = 0.50,  # to reset after amyloid impairment
+        base_sensing_efficiency: float | None = None,  # defaults to sensing_efficiency
         damage_chance: float = 0.005,
         neuron_distance: int = 5,
         damage_radius: int = 3,
@@ -1019,24 +1046,24 @@ class MicrogliaNeuronModel(Model):
         death_chance: float = 0.25,
         # Microglia / Astrocyte phenotype signal thresholds (microglia)
         homeo_signal_thresh: float = 1.0,
-        pro_inflam_signal_thresh: float = 0.2,
-        anti_inflam_signal_thresh: float = 0.8,
-        homeo_chance: float = 0.2,
+        pro_inflam_signal_thresh: float = 1.05,
+        anti_inflam_signal_thresh: float = 0.95,
+        homeo_chance: float = 0.01,
         pro_inflam_chance: float = 0.2,
         anti_inflam_chance: float = 0.2,
         # Astrocyte-specific phenotype thresholds
         astro_homeo_signal_thresh: float = 0.5,
-        astro_pro_inflam_signal_thresh: float = 0.15,
-        astro_anti_inflam_signal_thresh: float = 0.6,
-        astro_homeo_chance: float = 0.25,
+        astro_pro_inflam_signal_thresh: float = 1.05,
+        astro_anti_inflam_signal_thresh: float = 0.95,
+        astro_homeo_chance: float = 0.01,
         astro_pro_inflam_chance: float = 0.3,
         astro_anti_inflam_chance: float = 0.3,
         # signal decay
         pro_decay: float = 0.20,
         anti_decay: float = 0.10,
         # resolution times (separate for microglia vs astrocytes)
-        m2_to_m0_resolution_ticks: int = 10,   # microglia M2 -> M0
-        a2_to_a0_resolution_ticks: int = 15,   # astrocyte A2 -> A0
+        m0_resolution_ticks: int = 10,         # microglia M1/M2 -> M0
+        a0_resolution_ticks: int = 10,         # astrocyte A1/A2 -> A0
         # astrocyte-driven microglia recruitment (optional; used inside Astrocyte)
         recruitment_threshold: float = 3.0,
         microglia_recruitment_prob: float = 0.01,
@@ -1065,9 +1092,11 @@ class MicrogliaNeuronModel(Model):
         amyloid_diffusion: float = 0.1,
         amyloid_decay: float = 0.05,
         amyloid_growth: float = 0.1,
+        amyloid_carrying_capacity: float = 5.0,
         amyloid_fibril_thresh: float = 2.0,
         microglia_ld_from_amyloid: float = 1.0,
         microglia_amyloid_clearance: float = 0.5,
+        microglia_lipid_impairment_factor: float = 0.05,
         microglia_amyloid_impairment_factor: float = 0.2,
         
         # --- Genotype parameters ---
@@ -1092,7 +1121,9 @@ class MicrogliaNeuronModel(Model):
             init_a2_astrocytes (int, optional): Initial number of A2 astrocytes. Defaults to 5.
             astro_coverage_radius (int, optional): Astrocyte coverage radius. Defaults to 2.
             eat_probability (float, optional): Probability that a microglia will eat a neuron. Defaults to 0.70.
-            sensing_efficiency (float, optional): Efficiency of microglia sensing signals. Defaults to 0.50.
+            base_eat_probability (float, optional): Optional baseline used when recalculating effective phagocytosis after impairment. Defaults to eat_probability.
+            sensing_efficiency (float, optional): Baseline efficiency of microglia sensing signals. Defaults to 0.50.
+            base_sensing_efficiency (float, optional): Optional baseline used when recalculating effective sensing after impairment. Defaults to sensing_efficiency.
             damage_chance (float, optional): Chance that a neuron will be damaged. Defaults to 0.005.
             neuron_distance (int, optional): Distance between neurons in the grid. Defaults to 5.
             damage_radius (int, optional): Radius within which a damaged neuron affects nearby cells. Defaults to 3.
@@ -1104,20 +1135,21 @@ class MicrogliaNeuronModel(Model):
             death_ratio_thresh (float, optional): Death ratio threshold for triggering certain behaviors. Defaults to 0.9.
             death_chance (float, optional): Chance that a damaged neuron will die. Defaults to 0.25.
             homeo_signal_thresh (float, optional): Homeostatic signal threshold for triggering certain behaviors. Defaults to 1.0.
-            pro_inflam_signal_thresh (float, optional): Pro-inflammatory signal threshold for triggering certain behaviors. Defaults to 0.2.
-            anti_inflam_signal_thresh (float, optional): Anti-inflammatory signal threshold for triggering certain behaviors. Defaults to 0.8.
-            homeo_chance (float, optional): Chance that a microglia will produce homeostatic signals. Defaults to 0.2.
+            pro_inflam_signal_thresh (float, optional): Pro/anti ratio threshold above which microglia are biased toward M1. Defaults to 1.05.
+            anti_inflam_signal_thresh (float, optional): Pro/anti ratio threshold below which microglia are biased toward M2. Defaults to 0.95.
+            homeo_chance (float, optional): Chance that a microglia will produce homeostatic signals. Defaults to 0.01.
             pro_inflam_chance (float, optional): Chance that a microglia will produce pro-inflammatory signals. Defaults to 0.2.
             anti_inflam_chance (float, optional): Chance that a microglia will produce anti-inflammatory signals. Defaults to 0.2.
             astro_homeo_signal_thresh (float, optional): Astrocyte homeostatic signal threshold for triggering certain behaviors. Defaults to 0.5.
-            astro_pro_inflam_signal_thresh (float, optional): Astrocyte pro-inflammatory signal threshold for triggering certain behaviors. Defaults to 0.15.
-            astro_anti_inflam_signal_thresh (float, optional): Astrocyte anti-inflammatory signal threshold for triggering certain behaviors. Defaults to 0.6.
-            astro_homeo_chance (float, optional): Chance that an astrocyte will produce homeostatic signals. Defaults to 0.25.
+            astro_pro_inflam_signal_thresh (float, optional): Pro/anti ratio threshold above which astrocytes are biased toward A1. Defaults to 1.05.
+            astro_anti_inflam_signal_thresh (float, optional): Pro/anti ratio threshold below which astrocytes are biased toward A2. Defaults to 0.95.
+            astro_homeo_chance (float, optional): Chance that an astrocyte will produce homeostatic signals. Defaults to 0.01.
             astro_pro_inflam_chance (float, optional): Chance that an astrocyte will produce pro-inflammatory signals. Defaults to 0.3.
             astro_anti_inflam_chance (float, optional): Chance that an astrocyte will produce anti-inflammatory signals. Defaults to 0.3.
             pro_decay (float, optional): Pro-inflammatory signal decay rate. Defaults to 0.20.
             anti_decay (float, optional): Anti-inflammatory signal decay rate. Defaults to 0.10.
-            m2_to_m0_resolution_ticks (int, optional): Number of ticks to resolve M2 to M0 microglia transition. Defaults to 10.
+            m0_resolution_ticks (int, optional): Number of low-signal ticks to resolve M1 or M2 to M0 microglia transition. Defaults to 10.
+            a0_resolution_ticks (int, optional): Number of low-signal ticks to resolve A1 or A2 to A0 astrocyte transition. Defaults to 10.
             microglia_recruitment_prob (float, optional): Probability that a microglia will be recruited. Defaults to 0.01.
             neuron_ld_production_rate (float, optional): Rate at which neurons produce lipid droplets. Defaults to 0.2.
             neuron_ld_damage_boost (float, optional): Boost in lipid droplet production due to damage. Defaults to 0.5.
@@ -1137,11 +1169,13 @@ class MicrogliaNeuronModel(Model):
             initial_amyloid_patches (int, optional): Initial number of amyloid patches. Defaults to 5.
             amyloid_diffusion (float, optional): Amyloid diffusion rate. Defaults to 0.1.
             amyloid_decay (float, optional): Amyloid decay rate. Defaults to 0.05.
-            amyloid_growth (float, optional): Amyloid growth rate. Defaults to 0.1.
+            amyloid_growth (float, optional): Amyloid logistic growth rate. Defaults to 0.1.
+            amyloid_carrying_capacity (float, optional): Per-patch carrying capacity K used to cap logistic amyloid growth. Defaults to 5.0.
             amyloid_fibril_thresh (float, optional): Amyloid threshold for fibril formation. Defaults to 2.0.
             microglia_ld_from_amyloid (float, optional): Lipid droplet production from amyloid exposure. Defaults to 1.0.
             microglia_amyloid_clearance (float, optional): Rate at which microglia clear amyloid. Defaults to 0.5.
-            microglia_amyloid_impairment_factor (float, optional): Factor by which amyloid impairs microglia function. Defaults to 0.2.
+            microglia_lipid_impairment_factor (float, optional): Baseline strength of lipid-burden impairment on microglial sensing and phagocytosis. Defaults to 0.05.
+            microglia_amyloid_impairment_factor (float, optional): Extra multiplier on lipid-burden impairment while amyloid exposure persists. Defaults to 0.2.
             apoe_genotype (str, optional): APOE genotype of the model. Defaults to "3/3".
             trem2_mutation_rate (float, optional): Probability that microglia have a TREM2 mutation. Defaults to 0.25.
             trem2_mutant_activity (float, optional): Activity level of TREM2 mutant microglia. Defaults to 0.5.
@@ -1156,6 +1190,10 @@ class MicrogliaNeuronModel(Model):
 
         # params
         self.eat_probability = float(eat_probability)
+        if base_eat_probability is None:
+            base_eat_probability = eat_probability
+        if base_sensing_efficiency is None:
+            base_sensing_efficiency = sensing_efficiency
         self.sensing_efficiency = float(sensing_efficiency)
         self.base_eat_probability = float(base_eat_probability)
         self.base_sensing_efficiency = float(base_sensing_efficiency)
@@ -1192,8 +1230,8 @@ class MicrogliaNeuronModel(Model):
         self.anti_decay = float(anti_decay)
 
         # resolution times
-        self.m2_to_m0_resolution_ticks = int(m2_to_m0_resolution_ticks)  # microglia
-        self.a2_to_a0_resolution_ticks = int(a2_to_a0_resolution_ticks)  # astrocytes
+        self.m0_resolution_ticks = int(m0_resolution_ticks)  # microglia
+        self.a0_resolution_ticks = int(a0_resolution_ticks)  # astrocytes
 
         # astrocyte params
         self.astro_coverage_radius = int(astro_coverage_radius)
@@ -1253,7 +1291,8 @@ class MicrogliaNeuronModel(Model):
         # patch amyloid plaque fields (concentration with thresholds represent monomers, polymers, plaques with different sizes and movement dynamics)
         self.amyloid_val = np.zeros(shp, dtype=float)
         self.amyloid_decay = float(amyloid_decay)  # decay rate of amyloid concentration per tick
-        self.amyloid_growth = float(amyloid_growth)   # growth rate of amyloid concentration per tick, influenced by local conditions (e.g., more growth if near damaged neurons or pro-inflammatory microglia)
+        self.amyloid_growth = float(amyloid_growth)   # logistic growth rate of amyloid concentration per tick
+        self.amyloid_carrying_capacity = float(amyloid_carrying_capacity)
         self.diffusion_rate = float(amyloid_diffusion)     # diffusion rate of amyloid across the grid
         self.init_amyloid_patches = int(initial_amyloid_patches)
         
@@ -1261,6 +1300,7 @@ class MicrogliaNeuronModel(Model):
         self.amyloid_fibril_thresh = float(amyloid_fibril_thresh)
         self.microglia_ld_from_amyloid = float(microglia_ld_from_amyloid)
         self.microglia_amyloid_clearance = float(microglia_amyloid_clearance)
+        self.microglia_lipid_impairment_factor = float(microglia_lipid_impairment_factor)
         self.microglia_amyloid_impairment_factor = float(microglia_amyloid_impairment_factor)
 
         # agents
@@ -1416,13 +1456,22 @@ class MicrogliaNeuronModel(Model):
                     for a in m.astrocytes
                     if a.pos is not None
                 )),
-                # Track amount of amyloid present total and average per patch
-                "total_amyloid_patches": lambda m: float(m.amyloid_val.sum()),
-                "average_amyloid_value": lambda m: float(m.amyloid_val[m.amyloid_val > 0].mean()),
-                # Track number of monomers, polymers, and plaques possibly (assume anything below 2 is monomer, 2-4 is polymer, above 4 is plaque for example)
+                # Track amyloid concentration totals and occupied patch counts.
+                "total_amyloid_value": lambda m: float(m.amyloid_val.sum()),
+                "total_amyloid_patches": lambda m: int(np.count_nonzero(m.amyloid_val > 0.0)),
+                "amyloid_positive_patch_count": lambda m: int(np.count_nonzero(m.amyloid_val > 0.0)),
+                "average_amyloid_value": lambda m: (
+                    float(m.amyloid_val[m.amyloid_val > 0.0].mean())
+                    if np.any(m.amyloid_val > 0.0)
+                    else 0.0
+                ),
+                # Concentration mass and patch counts by amyloid size class.
                 "amyloid_monomers_population": lambda m: float(np.sum((m.amyloid_val[(m.amyloid_val < 2) & (m.amyloid_val > 0.0)]))),
                 "amyloid_polymers_population": lambda m: float(np.sum((m.amyloid_val[(m.amyloid_val >= 2) & (m.amyloid_val < 4.0)]))),
                 "amyloid_plaques_population": lambda m: float(np.sum(m.amyloid_val[m.amyloid_val >= 4.0])),
+                "amyloid_monomer_patch_count": lambda m: int(np.count_nonzero((m.amyloid_val < 2.0) & (m.amyloid_val > 0.0))),
+                "amyloid_polymer_patch_count": lambda m: int(np.count_nonzero((m.amyloid_val >= 2.0) & (m.amyloid_val < 4.0))),
+                "amyloid_plaque_patch_count": lambda m: int(np.count_nonzero(m.amyloid_val >= 4.0)),
                 # --- Genotype metrics ---
                 "microglia_TREM2_mutant": lambda m: sum(
                     1 for mg in m.microglia
@@ -1560,7 +1609,8 @@ class MicrogliaNeuronModel(Model):
         Amyloid can also have a baseline production rate and a clearance mechanism (not implemented here but could be added).
         """
         diffusion_rate = self.diffusion_rate  # how much amyloid diffuses to neighboring cells per tick
-        growth_rate = self.amyloid_growth  # how much amyloid grows in place per tick
+        growth_rate = self.amyloid_growth  # logistic amyloid growth rate per tick
+        carrying_capacity = self.amyloid_carrying_capacity
         decay_rate = self.amyloid_decay  # how much amyloid decays per tick
 
         new_amyloid_val = np.copy(self.amyloid_val)
@@ -1586,14 +1636,18 @@ class MicrogliaNeuronModel(Model):
                         new_amyloid_val[new_x, new_y] += move_amount
                         new_amyloid_val[x, y] -= move_amount
                     
-                    # Growth
-                    new_amyloid_val[x, y] += val * growth_rate
+                    # Logistic growth: growth slows as local amyloid approaches K.
+                    if carrying_capacity > 0.0:
+                        logistic_factor = 1.0 - (val / carrying_capacity)
+                        new_amyloid_val[x, y] += val * growth_rate * logistic_factor
                     
                     # Decay
                     new_amyloid_val[x, y] -= val * decay_rate
 
         # Clamp values to non-negative
         np.maximum(new_amyloid_val, 0.0, out=new_amyloid_val)
+        if carrying_capacity > 0.0:
+            np.minimum(new_amyloid_val, carrying_capacity, out=new_amyloid_val)
         self.amyloid_val = new_amyloid_val
 
     def step(self):
@@ -1628,7 +1682,6 @@ class MicrogliaNeuronModel(Model):
         self.diffuse_move_amyloid()
 
         self.datacollector.collect(self)
-        self.steps += 1
 
     def all_damaged_cleared(self) -> bool:
         """ Helper to check if all damaged neurons have been cleared (used for stopping condition in some experiments). """
@@ -1649,9 +1702,9 @@ def run_sim(
     h_neurons=10,
     d_neurons=10,
     eat=0.70,
-    base_eat=0.70,
+    base_eat=None,
     sense=0.50,
-    base_sense=0.50,
+    base_sense=None,
     damage=0.005,
     ndist=5,
     radius=3,
@@ -1662,7 +1715,6 @@ def run_sim(
     a1_astro=5,
     a2_astro=5,
     astro_radius=2,
-    a2_res=15,
     recruit_thresh=3.0,
     recruit_prob=0.01,
 
@@ -1683,21 +1735,21 @@ def run_sim(
 
     # ---------------- Microglia phenotype signal knobs ----------------
     homeo_signal_thresh=1.0,
-    pro_inflam_signal_thresh=0.2,
-    anti_inflam_signal_thresh=0.8,
-    homeo_chance=0.2,
+    pro_inflam_signal_thresh=1.05,
+    anti_inflam_signal_thresh=0.95,
+    homeo_chance=0.01,
     pro_inflam_chance=0.2,
     anti_inflam_chance=0.2,
-    m2_to_m0_resolution_ticks=10,
+    m0_resolution_ticks=10,
 
     # ---------------- Astrocyte phenotype signal knobs ----------------
     astro_homeo_signal_thresh=0.5,
-    astro_pro_inflam_signal_thresh=0.15,
-    astro_anti_inflam_signal_thresh=0.6,
-    astro_homeo_chance=0.25,
+    astro_pro_inflam_signal_thresh=1.05,
+    astro_anti_inflam_signal_thresh=0.95,
+    astro_homeo_chance=0.01,
     astro_pro_inflam_chance=0.3,
     astro_anti_inflam_chance=0.3,
-    a2_to_a0_resolution_ticks=15,
+    a0_resolution_ticks=10,
 
     # ---------------- Field decay knobs ----------------
     pro_decay=0.20,
@@ -1723,10 +1775,12 @@ def run_sim(
     initial_amyloid_patches=5,
     amyloid_decay=0.05,
     amyloid_growth=0.1,
+    amyloid_carrying_capacity=5.0,
     amyloid_diffusion=0.1,
     amyloid_fibril_thresh=2.0,
     microglia_ld_from_amyloid=0.5,
     microglia_amyloid_clearance=0.1,
+    microglia_lipid_impairment_factor=0.05,
     microglia_amyloid_impairment_factor=0.5,
     
     apoe_genotype="3/3",
@@ -1745,9 +1799,9 @@ def run_sim(
         h_neurons (int, optional): Initial number of healthy neurons. Defaults to 10.
         d_neurons (int, optional): Initial number of damaged neurons. Defaults to 10.
         eat (float, optional): Base probability of microglia successfully eating a damaged neuron. Defaults to 0.70.
-        base_eat (float, optional): Base probability of microglia successfully eating a damaged neuron without any boosts. Defaults to 0.70.
+        base_eat (float, optional): Optional baseline used when recalculating effective phagocytosis after impairment. Defaults to eat.
         sense (float, optional): Base efficiency of microglia sensing nearby damage. Defaults to 0.50.
-        base_sense (float, optional): Base efficiency of microglia sensing nearby damage without any boosts. Defaults to 0.50.
+        base_sense (float, optional): Optional baseline used when recalculating effective sensing after impairment. Defaults to sense.
         damage (float, optional): Base chance of a healthy neuron becoming damaged each tick. Defaults to 0 .005.
         ndist (int, optional): Distance at which microglia can sense and eat damaged neurons. Defaults to 5.
         radius (int, optional): Radius of damage diffusion from damaged neurons. Defaults to 3.
@@ -1756,7 +1810,7 @@ def run_sim(
         a1_astro (int, optional): Initial number of A1 astrocytes. Defaults to 5.
         a2_astro (int, optional): Initial number of A2 astrocytes. Defaults to 5.
         astro_radius (int, optional): Radius of astrocyte influence on the grid. Defaults to 2.
-        a2_res (int, optional): Number of ticks it takes for an A2 astrocyte to resolve back to A0. Defaults to 15.
+        a0_resolution_ticks (int, optional): Number of low-signal ticks it takes for an A1 or A2 astrocyte to resolve back to A0. Defaults to 10.
         recruit_thresh (float, optional): Pro-inflammatory signal threshold for astrocytes to recruit microglia. Defaults to 3.0.
         recruit_prob (float, optional): Probability of recruiting a microglia when the pro-inflammatory signal threshold is met. Defaults to 0.01.
         neuron_ld_production_rate (float, optional): Rate at which neurons produce lipid droplets when damaged. Defaults to 0.2.
@@ -1771,16 +1825,16 @@ def run_sim(
         death_ratio_thresh (float, optional): Ratio of damage signal to healthy signal that increases the chance of a neuron transitioning from damaged to dead. Defaults to 0.9.
         death_chance (float, optional): Base chance of a damaged neuron transitioning to dead when the death ratio threshold is met and it has been damaged for at least damage_to_death_ticks. Defaults to 0.25.
         homeo_signal_thresh (float, optional): Threshold of pro/anti-inflammatory signal balance that increases the chance of a microglia transitioning to the homeostatic M0 phenotype. Defaults to 1.0.
-        pro_inflam_signal_thresh (float, optional): Threshold of pro-inflammatory signal that increases the chance of a microglia transitioning to the M1 phenotype. Defaults to 0.2.
-        anti_inflam_signal_thresh (float, optional): Threshold of anti-inflammatory signal that increases the chance of a microglia transitioning to the M2 phenotype. Defaults to 0.8.
-        homeo_chance (float, optional): Base chance of a microglia transitioning to the M0 phenotype when the homeostatic signal threshold is met. Defaults to 0.2.
+        pro_inflam_signal_thresh (float, optional): Pro/anti ratio threshold above which microglia are biased toward M1. Defaults to 1.05.
+        anti_inflam_signal_thresh (float, optional): Pro/anti ratio threshold below which microglia are biased toward M2. Defaults to 0.95.
+        homeo_chance (float, optional): Base chance of a microglia transitioning to the M0 phenotype when the homeostatic signal threshold is met. Defaults to 0.01.
         pro_inflam_chance (float, optional): Base chance of a microglia transitioning to the M1 phenotype when the pro-inflammatory signal threshold is met. Defaults to 0.2.
         anti_inflam_chance (float, optional): Base chance of a microglia transitioning to the M2 phenotype when the anti-inflammatory signal threshold is met. Defaults to 0.2.
-        m2_to_m0_resolution_ticks (int, optional): Number of ticks an M2 microglia must remain in a high anti-inflammatory signal environment before it can transition back to M0. Defaults to 10.
+        m0_resolution_ticks (int, optional): Number of low-signal ticks an M1 or M2 microglia must remain in a resolving environment before it can transition back to M0. Defaults to 10.
         astro_homeo_signal_thresh (float, optional): Threshold of pro/anti-inflammatory signal balance that increases the chance of an astrocyte transitioning to the homeostatic A0 phenotype. Defaults to 0.5.
-        astro_pro_inflam_signal_thresh (float, optional): Threshold of pro-inflammatory signal that increases the chance of an astrocyte transitioning to the A1 phenotype. Defaults to 0.15.
-        astro_anti_inflam_signal_thresh (float, optional): Threshold of anti-inflammatory signal that increases the chance of an astrocyte transitioning to the A2 phenotype. Defaults to 0.6.      
-        astro_homeo_chance (float, optional): Base chance of an astrocyte transitioning to the A0 phenotype when the homeostatic signal threshold is met. Defaults to 0.25.
+        astro_pro_inflam_signal_thresh (float, optional): Pro/anti ratio threshold above which astrocytes are biased toward A1. Defaults to 1.05.
+        astro_anti_inflam_signal_thresh (float, optional): Pro/anti ratio threshold below which astrocytes are biased toward A2. Defaults to 0.95.
+        astro_homeo_chance (float, optional): Base chance of an astrocyte transitioning to the A0 phenotype when the homeostatic signal threshold is met. Defaults to 0.01.
         astro_pro_inflam_chance (float, optional): Base chance of an astrocyte transitioning to the A1 phenotype when the pro-inflammatory signal threshold is met. Defaults to 0.3.
         astro_anti_inflam_chance (float, optional): Base chance of an astrocyte transitioning to the A2 phenotype when the anti-inflammatory signal threshold is met. Defaults to 0.3.
         pro_decay (float, optional): Per-tick decay rate of the pro-inflammatory signal. Defaults to 0.20.
@@ -1797,17 +1851,18 @@ def run_sim(
         dam_activation_ticks (int, optional): Number of ticks a microglia must remain above the DAM activation threshold before it transitions to the DAM state. Defaults to 5
         initial_amyloid_patches (int, optional): Number of initial amyloid patches to seed in the grid. Defaults to 5.
         amyloid_decay (float, optional): Per-tick decay rate of amyloid patches. Defaults to 0.05.
-        amyloid_growth (float, optional): Per-tick growth rate of amyloid patches. Defaults to 0.1.
+        amyloid_growth (float, optional): Per-tick logistic growth rate of amyloid patches. Defaults to 0.1.
+        amyloid_carrying_capacity (float, optional): Per-patch carrying capacity K used to cap logistic amyloid growth. Defaults to 5.0.
         amyloid_diffusion (float, optional): Per-tick diffusion rate of amyloid patches to neighboring cells. Defaults to 0.1.
         amyloid_fibril_thresh (float, optional): Amyloid concentration threshold above which the amyloid is considered fibrillar and more toxic. Defaults to 2.0.   
         microglia_ld_from_amyloid (float, optional): Amount of lipid droplets a microglia gains from being exposed to amyloid patches, boosting its pro-inflammatory signaling. Defaults to 0.5.
         microglia_amyloid_clearance (float, optional): Amount by which a microglia can reduce the amyloid concentration in a patch when it interacts with it, representing clearance. Defaults to 0.1.
-        microglia_amyloid_impairment_factor (float, optional): Factor by which the presence of amyloid impairs microglia's ability to eat damaged neurons, representing the toxic effect of amyloid on microglial function. Defaults to 0.5.
+        microglia_lipid_impairment_factor (float, optional): Baseline strength of lipid-burden impairment on microglial sensing and phagocytosis. Defaults to 0.05.
+        microglia_amyloid_impairment_factor (float, optional): Extra multiplier on lipid-burden impairment while amyloid exposure persists. Defaults to 0.5.
         apoe_genotype (str, optional): APOE genotype of the system, which can influence various parameters such as amyloid dynamics, microglia behavior, and neuron vulnerability. Defaults to "3/3".
         trem2_mutation_rate (float, optional): Proportion of microglia that have a TREM2 mutation, which impairs their function. Defaults to 0.0.
         trem2_mutant_activity (float, optional): Relative activity level of TREM2 mutant microglia compared to wild-type, affecting their sensing and eating capabilities. Defaults to 0.5.
     """
-    
     model = MicrogliaNeuronModel(
         width=width,
         height=height,
@@ -1831,7 +1886,7 @@ def run_sim(
         init_a1_astrocytes=a1_astro,
         init_a2_astrocytes=a2_astro,
         astro_coverage_radius=astro_radius,
-        a2_to_a0_resolution_ticks=a2_to_a0_resolution_ticks,
+        a0_resolution_ticks=a0_resolution_ticks,
 
         recruitment_threshold=recruit_thresh,
         microglia_recruitment_prob=recruit_prob,
@@ -1858,7 +1913,7 @@ def run_sim(
         homeo_chance=homeo_chance,
         pro_inflam_chance=pro_inflam_chance,
         anti_inflam_chance=anti_inflam_chance,
-        m2_to_m0_resolution_ticks=m2_to_m0_resolution_ticks,
+        m0_resolution_ticks=m0_resolution_ticks,
 
         # Astrocyte phenotype signals
         astro_homeo_signal_thresh=astro_homeo_signal_thresh,
@@ -1892,10 +1947,12 @@ def run_sim(
         initial_amyloid_patches=initial_amyloid_patches,
         amyloid_decay=amyloid_decay,
         amyloid_growth=amyloid_growth,
+        amyloid_carrying_capacity=amyloid_carrying_capacity,
         amyloid_diffusion=amyloid_diffusion,
         amyloid_fibril_thresh=amyloid_fibril_thresh,
         microglia_ld_from_amyloid=microglia_ld_from_amyloid,
         microglia_amyloid_clearance=microglia_amyloid_clearance,
+        microglia_lipid_impairment_factor=microglia_lipid_impairment_factor,
         microglia_amyloid_impairment_factor=microglia_amyloid_impairment_factor,
         
         apoe_genotype=apoe_genotype,
@@ -1922,9 +1979,9 @@ def main():
     ap.add_argument("--h_neurons", type=int, default=10)
     ap.add_argument("--d_neurons", type=int, default=10)
     ap.add_argument("--eat", type=float, default=0.70)
-    ap.add_argument("--base_eat", type=float, default=0.70)
+    ap.add_argument("--base_eat", type=float, default=None)
     ap.add_argument("--sense", type=float, default=0.50)
-    ap.add_argument("--base_sense", type=float, default=0.50)
+    ap.add_argument("--base_sense", type=float, default=None)
     ap.add_argument("--damage", type=float, default=0.005)
     ap.add_argument("--ndist", type=int, default=5)
     ap.add_argument("--radius", type=int, default=3)
@@ -1934,7 +1991,7 @@ def main():
     ap.add_argument("--a1_astro", type=int, default=5)
     ap.add_argument("--a2_astro", type=int, default=5)
     ap.add_argument("--astro_radius", type=int, default=2)
-    ap.add_argument("--a2_res", type=int, default=15)
+    ap.add_argument("--a0_resolution_ticks", type=int, default=10)
     ap.add_argument("--recruit_thresh", type=float, default=3.0)
     ap.add_argument("--recruit_prob", type=float, default=0.01)
     # lipid knobs
@@ -1952,17 +2009,17 @@ def main():
     ap.add_argument("--death_chance", type=float, default=0.25)
     # microglia phenotype signal knobs
     ap.add_argument("--homeo_signal_thresh", type=float, default=1.0)
-    ap.add_argument("--pro_inflam_signal_thresh", type=float, default=0.2)
-    ap.add_argument("--anti_inflam_signal_thresh", type=float, default=0.8)
-    ap.add_argument("--homeo_chance", type=float, default=0.2)
+    ap.add_argument("--pro_inflam_signal_thresh", type=float, default=1.05)
+    ap.add_argument("--anti_inflam_signal_thresh", type=float, default=0.95)
+    ap.add_argument("--homeo_chance", type=float, default=0.01)
     ap.add_argument("--pro_inflam_chance", type=float, default=0.2)
     ap.add_argument("--anti_inflam_chance", type=float, default=0.2)
-    ap.add_argument("--m2_to_m0_resolution_ticks", type=int, default=10)
+    ap.add_argument("--m0_resolution_ticks", type=int, default=10)
     # astrocyte phenotype signal knobs
     ap.add_argument("--astro_homeo_signal_thresh", type=float, default=0.5)
-    ap.add_argument("--astro_pro_inflam_signal_thresh", type=float, default=0.15)
-    ap.add_argument("--astro_anti_inflam_signal_thresh", type=float, default=0.6)
-    ap.add_argument("--astro_homeo_chance", type=float, default=0.25)
+    ap.add_argument("--astro_pro_inflam_signal_thresh", type=float, default=1.05)
+    ap.add_argument("--astro_anti_inflam_signal_thresh", type=float, default=0.95)
+    ap.add_argument("--astro_homeo_chance", type=float, default=0.01)
     ap.add_argument("--astro_pro_inflam_chance", type=float, default=0.3)
     ap.add_argument("--astro_anti_inflam_chance", type=float, default=0.3)
     # field decay knobs
@@ -1985,10 +2042,12 @@ def main():
     ap.add_argument("--initial_amyloid_patches", type=int, default=5)
     ap.add_argument("--amyloid_decay", type=float, default=0.05)
     ap.add_argument("--amyloid_growth", type=float, default=0.1)
+    ap.add_argument("--amyloid_carrying_capacity", type=float, default=5.0)
     ap.add_argument("--amyloid_diffusion", type=float, default=0.1)
     ap.add_argument("--amyloid_fibril_thresh", type=float, default=2.0)
     ap.add_argument("--microglia_ld_from_amyloid", type=float, default=0.5)
     ap.add_argument("--microglia_amyloid_clearance", type=float, default=0.1)
+    ap.add_argument("--microglia_lipid_impairment_factor", type=float, default=0.05)
     ap.add_argument("--microglia_amyloid_impairment_factor", type=float, default=0.5)
     ap.add_argument("--apoe_genotype", type=str, default="3/3")
     ap.add_argument("--trem2_mutation_rate", type=float, default=0.0)
